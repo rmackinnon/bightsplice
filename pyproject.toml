@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bightsplice"
+version = "0.1.0"
+description = "Reassemble split Python project packs, merge collisions, and reconcile imports."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "libcst>=1.4",
+    "rope>=1.14",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+bightsplice = "bightsplice.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
