@@ -2,671 +2,609 @@
 
 ## Project
 
-`bightsplice` is a Python project reassembly and merge tool.
+`bightsplice` is a Python project reassembly and reconciliation tool.
 
-Its purpose is to reconstruct a complete Python project from two or more partial file packs, reconcile overlapping file trees, merge colliding Python source files where safe, and validate or repair Python imports after reconstruction.
+It reconstructs a complete project from a baseline project tree and one or
+more partial file packs. It combines file trees, reconciles Python source-file
+collisions, repairs imports after the final project topology is known, tracks
+all work in a resumable journal, and validates the completed merge before
+publication.
 
-The tool must favor correctness, traceability, and conservative automatic modification over aggressive guessing.
+The project favors correctness, traceability, source preservation, and
+conservative automation over speculative fixes.
 
 ---
 
-## Core Requirements
+## Core Behavior
 
 `bightsplice` must:
 
-* Accept two or more project/file-pack source trees.
-* Reconstruct a unified destination file tree.
-* Preserve files that exist in only one source pack.
-* Detect identical duplicate files and deduplicate them.
-* Detect file-path collisions.
-* Merge colliding Python files structurally where safe.
-* Detect symbol-level conflicts inside colliding Python files.
-* Preserve source provenance throughout the merge.
-* Analyze Python imports across the reconstructed project.
-* Validate relative and absolute imports.
-* Detect imports that became invalid because modules were moved, renamed, or reorganized.
-* Repair imports automatically only when the replacement can be determined with high confidence.
-* Report ambiguous or unsafe repairs instead of guessing.
-* Preserve comments and formatting when modifying Python source.
-* Support dry-run operation before modifying the destination project.
-* Produce a detailed merge and validation report.
+- Treat the currently exposed baseline tree as positive state.
+- Preserve baseline files when an incoming pack has no corresponding file.
+- Accept one or more incoming file packs.
+- If no explicit baseline project exists, treat the first pack as the baseline.
+- Ignore `.git/` completely during inventory, hashing, collision analysis,
+  staging, and verification.
+- Support configurable additional ignore/exclude patterns.
+- Detect identical files and deduplicate them.
+- Detect differing file collisions.
+- Reconcile Python collisions structurally.
+- Preserve comments, formatting, ordering, and local coding choices whenever
+  possible.
+- Defer project-wide import reconciliation until the complete staged tree is
+  known.
+- Track provenance.
+- Use persistent, resumable runs.
+- Treat the journal as the authoritative audit trail.
+- Never apply a safe subset of a Python module merge when that module contains
+  a blocking conflict.
+- Allow unrelated merge operations to continue while conflicts are marked.
+- Block publish while unresolved blocking or `MARK` conflicts remain.
 
 ---
 
-## Python Version
+## Language Handling
 
-Target Python:
+Use a generic language-handler boundary:
 
-```text
-Python >= 3.11
+```mermaid
+classDiagram
+    class LanguageHandler {
+        <<Protocol>>
+        +can_handle(path) bool
+        +analyze(path, project_root) ModuleAnalysis
+        +plan_merge(baseline, incoming) ModuleMergePlan
+        +reconcile(baseline_path, incoming_path, plan) ReconciledModule
+        +validate_source(source, path) list
+    }
+
+    class PythonLanguageHandler
+
+    LanguageHandler <|.. PythonLanguageHandler
 ```
 
-Do not add compatibility code for older Python versions unless explicitly required.
+Version 1 implements only `PythonLanguageHandler`.
+
+If language-aware processing is explicitly requested for an unsupported
+language, raise `UnsupportedLanguageError`.
+
+Ordinary non-Python collisions remain generic file collisions rather than
+automatically raising an unsupported-language exception.
 
 ---
 
-## Required Libraries
+## Python Tooling Responsibilities
 
-Use the following technologies as complementary layers:
+### Python `ast`
 
-```text
-rope>=1.14
-libcst>=1.4
-```
+Use `ast` for:
 
-Python's built-in `ast` module is also a core implementation dependency.
+- syntax parsing required by internal analysis
+- import discovery
+- symbol discovery
+- class/function/assignment inventory
+- structural comparison
+- structural hashes
+- lightweight semantic checks
 
-### AST
-
-Use Python `ast` for:
-
-* syntax validation
-* module inspection
-* import discovery
-* symbol discovery
-* class/function/assignment inventory
-* structural comparison
-* structural hashes
-* semantic checks that do not require source preservation
-
-Do not use AST unparsing as the primary mechanism for rewriting project files.
-
-Avoid workflows based on:
-
-```python
-ast.parse(...)
-ast.unparse(...)
-```
-
-when the result would replace user source, because this can alter formatting and discard comments.
+Do not use `ast.unparse()` as the normal source-rewrite mechanism.
 
 ### LibCST
 
-Use LibCST for source-preserving modifications.
+Use LibCST for source-preserving edits:
 
-LibCST should handle operations such as:
-
-* adding imports
-* removing imports
-* replacing imports
-* inserting definitions
-* merging compatible definitions
-* retaining comments
-* retaining whitespace
-* retaining formatting
-* rendering modified Python modules
-
-Whenever Python source must be rewritten, prefer LibCST unless there is a strong technical reason not to.
+- import insertion/removal/replacement
+- compatible import consolidation
+- alias rewrites
+- definition insertion
+- metadata updates
+- source rendering while preserving comments and formatting
 
 ### Rope
 
-Use Rope for project-aware refactoring.
+Use Rope for project-aware refactoring:
 
-Rope should handle or assist with:
+- module and symbol renames
+- moves
+- affected-reference discovery
+- updating references caused by `bightsplice` refactors
 
-* project/module resolution
-* module moves
-* module renames
-* symbol renames
-* updating references
-* updating imports after project restructuring
-* determining relationships between Python resources
-
-Keep Rope integration behind a project adapter rather than coupling Rope directly into unrelated classes.
+Keep Rope behind a narrow adapter.
 
 ---
 
 ## Architecture
 
-Keep responsibilities separated.
+```mermaid
+flowchart TD
+    A[Baseline Project or First Pack] --> B[Create Persistent Run]
+    B --> C[Inventory Baseline and Packs]
+    C --> D[Build Unified Positive Tree]
+    D --> E[Build Merge Plan]
+
+    E --> F[Process File Operations]
+    F --> G{Collision Type}
+
+    G -->|Unique| H[Add]
+    G -->|Identical| I[Deduplicate]
+    G -->|Python| J[PythonLanguageHandler]
+    G -->|Other| K[Generic Collision]
+
+    J --> L[AST Analysis]
+    J --> M[LibCST Reconciliation]
+
+    K --> N[Record Conflict]
+    M --> O[Atomic Staging Write]
+
+    N --> P[Journal]
+    O --> P
+
+    P --> Q{Structural Merge Complete?}
+    Q -->|No| F
+    Q -->|Yes| R{Unresolved Blocking Conflicts?}
+
+    R -->|Yes| S[Wait for Conflict Resolution]
+    R -->|No| T[Project-Wide Import Reconciliation]
+
+    T --> U[Validate]
+    U --> V[Commit]
+    V --> W[Publish]
+    W --> X[Verify]
+    X --> Y[Preserve]
+    Y --> Z[Clean]
+```
+
+---
+
+## Module Merge Rules
+
+A Python module merge is atomic.
 
 ```mermaid
 flowchart TD
-    A[Input Packs] --> B[Pack Scanning]
-    B --> C[Unified Project Tree]
-    C --> D[Merge Planning]
+    A[Analyze Collision] --> B[Build ModuleMergePlan]
+    B --> C{Blocking Conflict?}
 
-    D --> E[File Merge]
-    D --> F[Python Module Merge]
+    C -->|Yes| D[Persist Conflict]
+    D --> E[Leave Baseline Module Unchanged]
 
-    F --> G[AST Analysis]
-    F --> H[LibCST Editing]
-
-    E --> I[Staging Project]
-    G --> I
-    H --> I
-
-    I --> J[Import Reconciliation]
-
-    J --> K[AST Analysis]
-    J --> L[Rope Refactoring]
-    J --> M[LibCST Edits]
-
-    K --> N[Validation]
-    L --> N
-    M --> N
-
-    N --> O[Reporting]
+    C -->|No| F[Reconcile Entire Module]
+    F --> G[Validate Candidate]
+    G --> H[Atomic Write to Staging]
 ```
 
-Do not collapse scanning, merging, import repair, and validation into one large class.
+Classes and functions are atomic in version 1:
 
----
+- structurally identical -> deduplicate
+- same name, meaningfully different -> conflict
 
-## Primary Components
+Assignments:
 
-### `MergeConfig`
+- identical -> deduplicate
+- same name, different value/meaning -> conflict
+- `__all__` receives special merge handling
 
-Owns user/configuration inputs such as:
+Preserve baseline source order. Do not alphabetically reorder classes,
+functions, or imports as part of reconciliation.
 
-* source packs
-* destination
-* dry-run/apply mode
-* collision policy
-* import repair policy
-
-### `PackScanner`
-
-Responsible only for discovering and inventorying source files.
-
-It should:
-
-* recursively scan source packs
-* ignore development/cache directories
-* calculate file hashes
-* classify Python files
-* preserve relative paths
-* identify source-pack provenance
-
-It should not perform merge decisions.
-
-### `ProjectTree`
-
-Represents the combined logical project tree.
-
-It should:
-
-* collect all source candidates by destination path
-* expose collisions
-* distinguish unique files from duplicate or conflicting files
-* provide the basis for module/package indexing
-
-### `MergePlanner`
-
-Determines what should happen to each destination path.
-
-Typical classifications:
-
-```text
-COPY
-DEDUPLICATE
-MERGE_PYTHON
-COLLISION
-```
-
-Planning should not modify files.
-
-### `ASTAnalyzer`
-
-Provides lightweight semantic analysis.
-
-It should expose reusable operations for:
-
-* parsing
-* imports
-* definitions
-* assignments
-* `__all__`
-* symbol inventory
-* structural comparison
-* structural hashing
-
-### `CSTEditor`
-
-Owns source-preserving Python edits.
-
-Do not scatter direct LibCST transformations throughout unrelated modules.
-
-### `ModuleMerger`
-
-This is a core `bightsplice` component.
-
-It should:
-
-* compare colliding Python modules
-* classify top-level statements
-* merge non-conflicting definitions
-* deduplicate equivalent definitions
-* detect conflicting definitions
-* preserve source text using LibCST
-* return conflicts rather than guessing
-
-### `ImportResolver`
-
-Responsible for determining whether imports are valid in the reconstructed project.
-
-It should understand:
-
-* absolute imports
-* relative imports
-* package-relative levels
-* `__init__.py` exports
-* namespace packages where practical
-* imported symbols
-* moved or renamed modules
-
-### `RopeProjectManager`
-
-Provide a narrow adapter around Rope.
-
-It should own:
-
-* project lifecycle
-* resource lookup
-* refactoring operations
-* applying Rope changes
-* validating Rope operations
-
-Do not expose Rope objects broadly across the application unless necessary.
-
-### `ProjectValidator`
-
-Validation should occur after reconstruction and again after import repair.
-
-Validation should include:
-
-* Python syntax
-* import resolution
-* imported-symbol resolution where practical
-* project compilation where practical
-* unresolved collision detection
-
-### `ProvenanceTracker`
-
-Every merged result should retain sufficient information to determine where it came from.
-
-Track at minimum:
-
-* source pack
-* source path
-* destination path
-* merged definitions
-* import repairs
-* conflict origins
-
-### `MergeReporter`
-
-Reporting should support human-readable output and machine-readable output.
-
-At minimum support:
-
-```text
-text
-json
-```
-
----
-
-## Component Relationships
-
-```mermaid
-classDiagram
-    class BightSpliceApp
-    class MergeConfig
-    class PackScanner
-    class ProjectTree
-    class MergePlanner
-    class ModuleMerger
-    class ASTAnalyzer
-    class CSTEditor
-    class ImportResolver
-    class RopeProjectManager
-    class ProjectValidator
-    class ProvenanceTracker
-    class MergeReporter
-
-    BightSpliceApp --> MergeConfig
-    BightSpliceApp --> PackScanner
-    BightSpliceApp --> ProjectTree
-    BightSpliceApp --> MergePlanner
-    BightSpliceApp --> ProjectValidator
-    BightSpliceApp --> MergeReporter
-
-    MergePlanner --> ModuleMerger
-    ModuleMerger --> ASTAnalyzer
-    ModuleMerger --> CSTEditor
-
-    ImportResolver --> ASTAnalyzer
-    ImportResolver --> RopeProjectManager
-    ImportResolver --> CSTEditor
-
-    ProjectValidator --> ImportResolver
-    MergeReporter --> ProvenanceTracker
-```
-
----
-
-## Python Collision Rules
-
-Do not treat Python file collisions as simple text concatenation.
-
-For colliding Python modules, classify top-level content into categories such as:
-
-* imports
-* assignments/constants
-* functions
-* async functions
-* classes
-* module metadata
-* executable statements
-* `if __name__ == "__main__"` blocks
-
-### Merge Decision Flow
-
-```mermaid
-flowchart TD
-    A[Colliding Python Files] --> B[Parse Both Files]
-    B --> C[Inventory Top-Level Objects]
-
-    C --> D[Imports]
-    C --> E[Assignments]
-    C --> F[Functions]
-    C --> G[Classes]
-    C --> H[Executable Statements]
-
-    D --> I[Deduplicate or Merge]
-    E --> J[Compare Name and Value]
-    F --> K[Compare Name Signature and AST]
-    G --> L[Compare Class Structure]
-    H --> M[Check Ordering and Side Effects]
-
-    J --> N{Conflict?}
-    K --> N
-    L --> N
-    M --> N
-
-    N -->|No| O[Build Merged Module with LibCST]
-    N -->|Yes| P[Create MergeConflict]
-
-    O --> Q[Import Reconciliation]
-```
-
-### Safe Merge
-
-The following are generally safe to merge automatically:
-
-* unique imports
-* identical imports
-* unique functions
-* unique classes
-* unique assignments
-* structurally identical duplicate definitions
-
-### Conflict
-
-The following should normally be treated as conflicts:
-
-* same symbol name with different function bodies
-* same symbol name with incompatible signatures
-* same class name with meaningfully different definitions
-* same constant/assignment name with different values
-* incompatible module initialization statements
-* ambiguous ordering-dependent executable statements
-
-Do not silently choose one conflicting definition unless an explicit collision policy requires it.
-
----
-
-## Structural Comparison
-
-AST structural comparison may be used to determine whether two Python definitions are semantically identical enough for deduplication.
-
-Structural hashes should exclude source-position metadata such as:
-
-* line number
-* column
-* end line
-* end column
-
-Comments and formatting are not part of semantic AST equality but must still be preserved when choosing the output source representation.
+Preceding comments travel with the source block they describe.
 
 ---
 
 ## Import Reconciliation
 
-After the unified project tree is assembled, build a module/package index before attempting repairs.
+Import reconciliation has two phases.
 
-For every import, determine:
+### Local merge-time import reconciliation
 
-1. Does the target module resolve?
-2. Does the requested relative-import level resolve correctly?
-3. Does the requested symbol appear to exist?
-4. Did the original module move or get renamed?
-5. Is there exactly one credible replacement?
+Within a colliding module:
 
-Examples to support:
+- deduplicate equivalent imports
+- combine compatible `from ... import ...` statements
+- preserve baseline import order
+- preserve aliases
+- prefer a user's explicit alias over the full-length binding when safe
+- use a weighted canonical-binding preference when multiple safe candidates
+  exist
+- never use weighting to override a semantic conflict
+- two different explicit aliases for the same dependency require user choice
+- an alias colliding with another module-level binding is blocking; suggest a
+  safe alias but let the user decide
+- preserve imports inside functions/classes
+- preserve `TYPE_CHECKING` context
+- preserve baseline comments and grouping
+- merge `__future__` imports in the legal module-header position, after an
+  optional module docstring
 
-```python
-from . import foo
-from .foo import Bar
-from ..foo import Bar
-from package.foo import Bar
-import package.foo
-```
+### Final project-wide reconciliation
 
-### Import Repair Flow
+Relative imports must be reevaluated against the final staged project tree
+before deduplication or repair.
+
+Do not treat raw relative levels as semantic identity.
 
 ```mermaid
-flowchart TD
-    A[Import Reference] --> B{Resolves?}
-
-    B -->|Yes| C[Keep Import]
-    B -->|No| D[Search Project Module Index]
-
-    D --> E[Find Candidate Modules]
-    E --> F{Exactly One Credible Candidate?}
-
-    F -->|No| G[Report Ambiguous or Broken Import]
-    F -->|Yes| H{Requested Symbol Exists?}
-
-    H -->|No| G
-    H -->|Yes| I[Propose Replacement]
-
-    I --> J{Repair Policy Allows Change?}
-
-    J -->|No| K[Report Proposed Repair]
-    J -->|Yes| L[Rewrite with LibCST or Rope]
-
-    L --> M[Revalidate Import]
+flowchart LR
+    A[Raw Import Syntax] --> B[Resolve in Source Context]
+    B --> C[Map to Final Project Tree]
+    C --> D[Resolved Dependency Identity]
+    D --> E[Deduplicate or Repair]
 ```
 
-### Automatic Repair
+Project-wide import repair begins only after all structural merges are known
+and blocking conflicts are resolved.
 
-Automatic import modification must be conservative.
+---
 
-A repair may be applied automatically when:
+## Star Imports
 
-* the current import does not resolve
-* a replacement module can be uniquely identified
-* the requested symbol exists in the candidate target where applicable
-* there is no credible competing candidate
+Support a configurable star-import policy.
 
-### Ambiguous Repair
+When configured to prefer a star import, an explicit import from the same
+module may be removed only if static analysis shows that the star import makes
+that binding available. If `__all__` exists and omits the binding, keep the
+explicit import.
 
-If multiple possible targets exist, report the issue instead of guessing.
+When `bightsplice` removes an explicit import because of star-import
+preference, add a concise explanatory source comment.
 
-Example:
+---
+
+## Conflict Resolution
+
+Conflicts are persistent first-class objects.
+
+Before asking the user to resolve a conflict, allow inspection of the
+conflicting source section.
+
+Supported resolution actions include:
+
+- `KEEP_BASELINE`
+- `KEEP_INCOMING`
+- `SELECT_ALIAS`
+- `RENAME_INCOMING`
+- `RENAME_BASELINE`
+- `MANUAL_EDIT`
+- `SKIP`
+- `MARK`
+
+`SKIP` means keep the baseline conflicting section, omit the incoming
+conflicting contribution, and continue.
+
+`MARK` leaves the conflict unresolved, allows unrelated work to continue, and
+blocks publish until resolved.
+
+A rename resolution must warn the user before execution that the affected merge
+plan will be rebuilt.
+
+### Manual edit
+
+Prepare a conflict workspace containing:
 
 ```text
+baseline.py
+incoming.py
+resolved.py
+```
+
+`resolved.py` should clearly mark baseline and incoming conflict regions, for
+example:
+
+```python
+# <<< BEGIN BASELINE CONFLICT
+...
+# <<< END BASELINE CONFLICT
+
+# >>> BEGIN INCOMING CONFLICT
+...
+# >>> END INCOMING CONFLICT
+```
+
+The user may delete, retain, combine, rename, or rewrite those sections.
+
+Open `resolved.py` using:
+
+1. explicitly configured editor
+2. `$EDITOR`
+3. print the file path if no editor is available
+
+An XDG `text/plain` lookup may be added later.
+
+Manual edits never directly overwrite staging. Validate the resolved source,
+record its hash, reanalyze it, and rebuild the affected merge plan.
+
+---
+
+## Persistent Runs and Journal
+
+Every merge is a persistent transaction.
+
+Use:
+
+```text
+.bightsplice/
+└── runs/
+    └── <run-id>/
+        ├── run.json
+        ├── journal.jsonl
+        ├── conflicts.json
+        ├── resolutions.json
+        ├── provenance.json
+        ├── conflicts/
+        └── staging/
+```
+
+The journal is the authoritative source of truth.
+
+Every action, state transition, conflict, resolution, write, validation result,
+recovery decision, publish action, and cleanup action must be journaled.
+
+Use JSONL: one JSON object per line.
+
+Use fixed-width hexadecimal numeric components in IDs, for example:
+
+```text
+op-0000002a
+event-0000007f
+conflict-00000003
+resolution-00000003
+```
+
+IDs are unique within a run. The run ID provides the outer namespace.
+
+Do not rely on filesystem timestamps for integrity decisions.
+
+---
+
+## Restart Modes
+
+Support user-selectable restart behavior:
+
+- `resume` — continue the same transaction; inputs/configuration must still
+  match
+- `recover` — replay the journal, verify staging, rebuild derived state, and
+  replan changed inputs when permitted
+- `restart` — preserve the old run and create a new run from current inputs
+
+Support listing known runs, including at least:
+
+- run ID
+- status
+- phase
+- timestamps
+- baseline project
+- destination
+- unresolved-conflict count
+
+---
+
+## Input Changes
+
+A run is bound to the input state and effective configuration it was planned
+against.
+
+Use content hashes, not timestamps.
+
+`.git/` is always excluded.
+
+Do not create a separate input manifest unless implementation later proves one
+necessary. The journal and run-state files should contain the source paths,
+hashes, configuration, and other state required for resume/recovery.
+
+Configuration changes are semantic input changes.
+
+---
+
+## Repeated Conflicts
+
+Fingerprint conflicts using relevant semantic inputs.
+
+After the same resolution has been selected for a configurable number of
+identical conflicts, offer to apply it to matching conflicts.
+
+Default threshold:
+
+```text
+3
+```
+
+Every bulk-applied resolution must still be journaled individually.
+
+Historical conflict-resolution replay should default to asking the user before
+reuse.
+
+---
+
+## Ignore / Exclude Rules
+
+Always ignore:
+
+```text
+.git/
+```
+
+Provide configurable default/user ignore patterns.
+
+Initial Python-oriented defaults may include:
+
+```text
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+```
+
+Keep the mechanism generic enough for future environments such as
+`node_modules/` or `.yarn/`.
+
+Do not implement a custom `.gitignore` parser.
+
+---
+
+## Validation
+
+Validation is about reconstructed-project integrity, not runtime-environment
+completeness.
+
+External dependency availability must not block publish.
+
+Version 1 uses Flake8 with its normal/default rule behavior as the user-facing
+source linting gate.
+
+Use `ast` internally where needed for `bightsplice` analysis.
+
+Do not import or execute project modules to validate them.
+
+Validation checks:
+
+- unresolved blocking/`MARK` conflicts
+- lint sources with Flake8
+- final internal import resolution
+- internal symbol resolution where statically determinable
+- consistency of Rope-assisted refactors initiated by `bightsplice`
+- staged-tree integrity
+
+Warnings are configurable. The default policy may fail validation on warnings.
+
+A validation failure may be manually repaired in staging and revalidated. All
+manual changes must be hash-tracked and journaled.
+
+---
+
+## Lifecycle Terminology
+
+Use these terms consistently in code, CLI output, journal events, and docs:
+
+```mermaid
+flowchart LR
+    A[Validate] --> B[Commit]
+    B --> C[Publish]
+    C --> D[Verify]
+    D --> E[Preserve]
+    E --> F[Clean]
+```
+
+`Commit` means freeze the validated `bightsplice` candidate. It does not mean a
+Git commit.
+
+---
+
+## Git Behavior
+
+The currently checked-out branch and exposed working tree at run start are the
+authoritative baseline.
+
+Do not require `main` or `master`.
+
+If the active branch is not `main` or `master`, display an informational
+notice only.
+
+Never switch the user's active branch.
+
+If Git-backed publishing is used, create a separate publish branch/worktree
+based on the currently checked-out branch, reproduce the exposed baseline state
+including uncommitted/untracked project files, then layer validated merge
+changes on top.
+
+Do not run `git add` or `git commit` automatically. After publish/verify, the
+user decides whether to stage, commit, merge, discard, or otherwise manage the
+Git result.
+
+Git is supporting infrastructure; `bightsplice` remains responsible for merge
+semantics.
+
+---
+
+## Positive Baseline Rule
+
+Missing incoming files never imply deletion.
+
+The published result is conceptually:
+
+```text
+baseline positive tree
++ accepted unique files
++ resolved collisions
++ reconciled Python modules
++ final import repairs
++ approved validation fixes
+```
+
+Baseline files persist unless an explicit merge/resolution action changes them.
+
+---
+
+## Publish and Verify
+
+After validation:
+
+1. `commit` freezes the validated staging candidate
+2. `publish` copies/applies the candidate to the configured destination or
+   Git-backed publish worktree
+3. `verify` checks the published managed tree against the committed expected
+   state using relative paths and hashes
+4. `preserve` retains audit data
+5. `clean` removes disposable successful-run data
+
+Never clean staging before publish and verify succeed.
+
+If publish or verify fails, preserve staging and diagnostics for
+resume/recovery.
+
+---
+
+## Preserve and Clean
+
+Keep completed-run audit data:
+
+- journal
+- run metadata
+- provenance
+- conflicts
+- resolutions
+- final hashes
+- relevant diagnostics
+
+Compress completed-run audit data by default with gzip.
+
+Design configuration so additional compression methods can be added later.
+
+After successful preserve, clean disposable successful-run data such as
+staging and temporary publish artifacts.
+
+Paused/failed staging data should remain available for diagnosis and recovery.
+
+Support explicit run cleanup/deletion commands.
+
+---
+
+## Reporting
+
+Reports should distinguish at least:
+
+```text
+ADDED
+DEDUPLICATED
+MERGED
+IMPORT FIXED
 BROKEN IMPORT
-source: package/router.py
-line: 12
-import: from .interfaces import Ethernet
-
-possible targets:
-    package.network.interfaces
-    package.devices.interfaces
-
-resolution: ambiguous
+SYMBOL COLLISION
+FILE COLLISION
+VALIDATION ERROR
+VALIDATION WARNING
+MARKED CONFLICT
+SKIPPED INCOMING
+PUBLISH ERROR
+VERIFY ERROR
 ```
 
----
-
-## Relative Imports
-
-Relative-import correctness must be evaluated against the final reconstructed package hierarchy, not the source-pack hierarchy.
-
-If a file's effective module location changes, recalculate the required relative import level.
-
-Avoid converting relative imports to absolute imports automatically unless explicitly configured.
-
----
-
-## Source Preservation
-
-User source should be changed as little as possible.
-
-Preserve wherever possible:
-
-* comments
-* formatting
-* blank lines
-* quoting style
-* annotations
-* decorator formatting
-* import grouping
-* source order
-
-Do not reformat an entire file merely because one import changed.
-
----
-
-## Dry Run
-
-Dry-run should be the default behavior.
-
-A dry run should:
-
-* scan all packs
-* build the unified tree
-* identify collisions
-* analyze Python modules
-* determine proposed merges
-* determine import repairs
-* perform validation where possible
-* produce a report
-
-It must not alter the destination project.
-
-Applying changes should require an explicit action such as:
-
-```bash
-bightsplice ... --apply
-```
-
----
-
-## Apply Flow
-
-```mermaid
-stateDiagram-v2
-    [*] --> Scan
-    Scan --> Plan
-    Plan --> Stage
-    Stage --> ReconcileImports
-    ReconcileImports --> Validate
-
-    Validate --> ReportFailure: validation fails
-    Validate --> Commit: validation passes and --apply
-
-    ReportFailure --> [*]
-    Commit --> ReportSuccess
-    ReportSuccess --> [*]
-```
-
----
-
-## Destination Safety
-
-Never destructively overwrite a destination tree without explicit user intent.
-
-When applying changes:
-
-* write through a staging area where practical
-* validate the staged project
-* report failures before replacement
-* avoid partial project updates where practical
-
----
-
-## Non-Python Files
-
-Non-Python collisions should not be merged semantically unless a dedicated handler exists.
-
-Default handling:
-
-* identical content: deduplicate
-* different content: report collision
-
-Optional policies may include:
-
-```text
-first
-last
-error
-```
-
-Do not silently overwrite differing non-Python files by default.
-
----
-
-## Provenance
-
-Provenance is a core requirement, not optional metadata.
-
-For every resulting file, retain enough information to identify all contributing source packs.
-
-For merged Python symbols, retain source information where practical.
-
-Example conceptual record:
-
-```json
-{
-  "destination": "package/network.py",
-  "sources": [
-    "pack-a/package/network.py",
-    "pack-c/package/network.py"
-  ],
-  "merged_symbols": {
-    "Ethernet": "pack-a",
-    "VLAN": "pack-c"
-  }
-}
-```
-
----
-
-## Error Handling
-
-Prefer explicit exceptions and structured conflict results.
-
-Do not use broad exception swallowing such as:
-
-```python
-try:
-    ...
-except Exception:
-    pass
-```
-
-If a recoverable parsing or merge failure occurs, record it in the merge report.
-
-Unexpected failures should retain enough context to identify:
-
-* source pack
-* source file
-* destination
-* operation being attempted
+Reports must explain automatic decisions.
 
 ---
 
@@ -674,14 +612,15 @@ Unexpected failures should retain enough context to identify:
 
 Use:
 
-* type annotations
-* `pathlib.Path`
-* `dataclasses` where appropriate
-* `Enum` / `StrEnum` for closed option sets
-* small focused classes
-* explicit return types
-* deterministic ordering
-* clear public/private method boundaries
+- Python >= 3.11
+- type annotations
+- `pathlib.Path`
+- dataclasses where appropriate
+- `Enum` / `StrEnum` for closed option sets
+- deterministic ordering
+- small focused classes
+- explicit return types
+- project-owned adapters around Rope and LibCST
 
 Prefer:
 
@@ -695,32 +634,9 @@ over:
 value is not None
 ```
 
-when following existing project coding conventions.
+when following project coding conventions.
 
-Avoid unnecessary abstraction layers.
-
-Do not build custom Python parsers when `ast`, LibCST, or Rope already provide the required functionality.
-
----
-
-## Dependency Boundaries
-
-Third-party libraries should be wrapped behind project-owned interfaces where practical.
-
-```mermaid
-flowchart LR
-    A[bightsplice Core Logic] --> B[ASTAnalyzer]
-    A --> C[CSTEditor]
-    A --> D[RopeProjectManager]
-
-    B --> E[Python ast]
-    C --> F[LibCST]
-    D --> G[Rope]
-```
-
-Avoid allowing the entire codebase to depend directly on LibCST or Rope internals.
-
-This makes library upgrades and implementation changes easier.
+Avoid broad exception swallowing.
 
 ---
 
@@ -728,127 +644,42 @@ This makes library upgrades and implementation changes easier.
 
 Use `pytest`.
 
-Tests should cover at minimum:
+At minimum test:
 
-* scanning
-* hashing
-* ignored directories
-* unique files
-* identical collisions
-* non-Python collisions
-* Python collision detection
-* symbol extraction
-* import extraction
-* relative-import resolution
-* structural hashes
-* duplicate symbol detection
-* safe Python merges
-* unsafe Python merges
-* LibCST source preservation
-* import repair
-* ambiguous import repair
-* namespace/package handling
-* provenance tracking
-* dry-run safety
+- inventory and ignore rules
+- hashing
+- positive-baseline behavior
+- duplicate files
+- generic collisions
+- Python module analysis
+- symbol deduplication/conflicts
+- atomic module merge behavior
+- import normalization
+- alias preference/conflicts
+- relative-import reevaluation
+- `__future__` handling
+- `TYPE_CHECKING`
+- local imports
+- star-import policy
+- provenance
+- journal replay
+- resume/recover/restart
+- input/config changes
+- repeated conflict threshold behavior
+- manual conflict workspace
+- lint validation
+- publish/verify lifecycle
+- Git baseline behavior
+- run preservation/compression/cleanup
 
-Regression tests should be added for every merge/import bug discovered.
-
----
-
-## Test Fixtures
-
-Prefer small artificial project trees.
-
-Example:
-
-```text
-pack-a/
-└── package/
-    ├── __init__.py
-    └── network.py
-
-pack-b/
-└── package/
-    ├── __init__.py
-    └── network.py
-```
-
-Tests should make it immediately obvious what behavior is being validated.
-
-For complex scenarios, place fixture projects under:
-
-```text
-tests/fixtures/
-```
-
----
-
-## Validation Before Completion
-
-Before considering an implementation change complete:
-
-1. Run the test suite.
-2. Validate Python syntax.
-3. Verify source-preserving edits.
-4. Check for unintended formatting changes.
-5. Review import-repair behavior.
-6. Check ambiguous cases are reported rather than guessed.
-7. Confirm dry-run performs no destination writes.
-8. Perform a code review of the changed implementation.
-
----
-
-## Reports
-
-Reports should distinguish at least:
-
-```text
-ADDED
-DEDUPLICATED
-MERGED
-IMPORT FIXED
-BROKEN IMPORT
-SYMBOL COLLISION
-FILE COLLISION
-VALIDATION ERROR
-```
-
-Reports should explain why an automatic decision was made.
-
-Example:
-
-```text
-[IMPORT FIXED]
-package/router/vlan.py:8
-
-before:
-    from ..interfaces.vlan import VLANOptions
-
-after:
-    from .interface.vlan import VLANOptions
-
-reason:
-    original module does not exist
-    replacement module is unique
-    requested symbol exists in replacement
-```
+Regression tests should be added for every discovered merge or recovery bug.
 
 ---
 
 ## Design Principle
 
-When choosing between:
+When choosing between an automatic but uncertain action and a reported,
+user-resolved action, prefer the reported and safe behavior.
 
-```text
-automatic but uncertain
-```
-
-and:
-
-```text
-reported but safe
-```
-
-choose the reported and safe behavior.
-
-`bightsplice` should be capable of performing sophisticated automatic reconciliation, but it must never hide uncertainty from the user.
+`bightsplice` may perform sophisticated reconciliation, but it must never hide
+uncertainty from the user.
